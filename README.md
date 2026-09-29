@@ -1,4 +1,4 @@
-# WindHawk--Mod--Minecraft-HideWindowsButton
+# WindHawk--Mod--HideWindowsButton
 
 Nesse repositório público está as modificações apresentadas no Canal @BitRizeBR(Youtube), Com ajuda do Claude.ai
 
