@@ -3,7 +3,7 @@
 // @name            Hide Start Button (hardened)
 // @description     Hides the Start button from the Windows 11 taskbar. Hardened fork of "Hide Start Button" with extra null checks, exception guards and hang protection.
 // @version         1.0.1
-// @author          ptrkhh (original), hardening changes by Claude
+// @author          ptrkhh (original), hardening changes by Claude and BitRizeBR
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject
