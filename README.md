@@ -5,7 +5,7 @@ Nesse repositório público está as modificações apresentadas no Canal @BitRi
 Ocultar o Botão Iniciar (reforçado / hardened)
 Oculta o botão Iniciar da barra de tarefas do Windows 11. O menu Iniciar ainda pode ser aberto com a tecla Win, Ctrl+Esc ou gestos em telas sensíveis ao toque. Apenas o Windows 11 é suportado.
 
-## Atenção Esse Mod foi testado na versão 25H2 
+## Atenção Esse Mod foi testado na versão 25H2 (Compilação 26200.9550)
 atualizações futuras podem crashar esse mod, mas o criador da modificação vai atualiza-lo
 
 Desativar o mod traz o botão de volta.
