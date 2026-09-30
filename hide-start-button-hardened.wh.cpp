@@ -1,13 +1,19 @@
 // ==WindhawkMod==
 // @id              hide-start-button-hardened
 // @name            Hide Start Button (hardened)
-// @description     Hides the Start button from the Windows 11 taskbar. Hardened fork of "Hide Start Button" with extra null checks, exception guards and hang protection.
-// @version         1.0.1
-// @author          ptrkhh (original), hardening changes by Claude and BitRizeBR
+// @description     Hides the Start button from the Windows 11 taskbar. Hardened fork with a build gate, sanity checks on internal pointers, and a degraded mode instead of risky behavior.
+// @version         1.1.0
+// @author          ptrkhh (original), BRUser1032 / BitRize (fork), hardening assisted by Claude
+// @github          https://github.com/BRUser1032
+// @homepage        https://github.com/BRUser1032/WindHawk--Mod--HideWindowsButton
 // @include         explorer.exe
 // @architecture    x86-64
 // @compilerOptions -lole32 -loleaut32 -lruntimeobject
 // ==/WindhawkMod==
+
+// NOTE: no @license tag on purpose. The license of the original mod
+// ("Hide Start Button" by ptrkhh) has not been verified yet. Do not add a
+// license here until it has been checked.
 
 // ==WindhawkModReadme==
 /*
@@ -15,35 +21,63 @@
 
 Hides the Start button from the Windows 11 taskbar. The Start menu can still
 be opened with the Win key, Ctrl+Esc or touchscreen gestures. Only Windows 11
-is supported.
-
-Disabling the mod brings the button back.
+is supported. Disabling the mod brings the button back.
 
 ## Credits
 
 Based on "Hide Start Button" by ptrkhh, which is in turn based on the
 "Start button always on the left" (taskbar-start-button-position) mod by
-m417z. This fork keeps the same design and only adds defensive code.
+m417z. This fork keeps the same design and adds defensive code.
+It was written with AI assistance and tested only on the builds listed below.
 
-## What was changed compared to the original 1.0
+## Tested builds
 
-- Null checks before dereferencing internal taskbar pointers.
-- C++ exception guards around every XAML call and every hook callback.
-- The Start button visibility is only written when it actually differs,
-  which avoids needless layout invalidations inside the arrange pass.
-- The cross-thread SendMessage now has a 2 second timeout, so a hung taskbar
-  thread can no longer block Explorer during mod load/unload.
-- Failures are written to the Windhawk log (Log tab) instead of being silent.
+- Windows 11 25H2, build 26200 (tested on 26200.9550)
 
-## Known limitation
+On any other build the mod **refuses to load** by default (see the setting
+below), because it depends on undocumented Windows internals.
 
-The mod still relies on undocumented Windows internals (symbols of
-taskbar.dll and a fixed virtual table index of the XAML UIElement class).
-A Windows update can change them. If the symbols are not found, the mod
-refuses to load. If only the virtual table index changes, Explorer may
-misbehave; in that case disable the mod and restart Explorer.
+## What the hardening does (and does not do)
+
+Does:
+- Refuses to load on untested Windows builds unless you opt in.
+- Validates that the internal XAML function it hooks (vtable index 92) lives
+  in a XAML module. If it does not, the mod keeps running in **degraded mode**:
+  the Start button is still collapsed, but the hook that closes the leftover
+  gap is not installed. No risky hook, no crash.
+- Checks that internal memory is readable (VirtualQuery) before reading it.
+- Logs which offset source was used (byte pattern or fallback) and the module
+  and RVA of the hooked function, so problems on new builds can be diagnosed.
+- Guards C++ exceptions around XAML calls and hook callbacks.
+- Writes the Start button visibility only when it changes.
+- Uses SendMessageTimeout (2 s) instead of SendMessage.
+
+Does not:
+- Catch access violations. `catch (...)` does not cover them; the readability
+  checks reduce the risk but cannot remove it (the memory can change between
+  the check and the read).
+- Verify that vtable index 92 is really `UIElement::Arrange`. It only checks
+  that the address belongs to a XAML module.
+- Guarantee anything after a Windows update. If Explorer misbehaves, disable
+  the mod and restart Explorer.
+
+## Settings
+
+- Allow untested Windows builds: off by default. Turn it on to try the mod on
+  another build, then check the Log tab.
 */
 // ==/WindhawkModReadme==
+
+// ==WindhawkModSettings==
+/*
+- allowUntestedBuilds: false
+  $name: Allow untested Windows builds
+  $description: >-
+    By default the mod only loads on Windows builds where it was tested.
+    Enabling this lets it try other builds. It depends on undocumented
+    internals, so use it at your own risk and check the Log tab.
+*/
+// ==/WindhawkModSettings==
 
 #include <windhawk_utils.h>
 
@@ -59,19 +93,147 @@ misbehave; in that case disable the mod and restart Explorer.
 
 using namespace winrt::Windows::UI::Xaml;
 
+// ---------------------------------------------------------------------------
+// Configuration constants
+// ---------------------------------------------------------------------------
+
+// Windows build numbers (major build, without the UBR) on which the mod was
+// actually tested. 26200 = 25H2. Add a build here only after testing it.
+constexpr DWORD kTestedBuilds[] = {26200};
+
+// Fixed vtable index of the XAML UIElement::Arrange implementation.
+// This is an internal detail of Windows and cannot be fully validated.
+constexpr int kArrangeVtableIndex = 92;
+
+// ---------------------------------------------------------------------------
+// Globals
+// ---------------------------------------------------------------------------
+
 std::atomic<bool> g_taskbarViewDllLoaded;
 std::atomic<bool> g_unloading;
+std::atomic<bool> g_arrangeHookActive;
+std::atomic<bool> g_offsetSourceLogged;
 thread_local bool g_inArrangeOverride;
+
+// RAII guard: the flag is always restored, even if something throws.
+struct ArrangeGuard {
+    bool prev;
+    ArrangeGuard() : prev(g_inArrangeOverride) { g_inArrangeOverride = true; }
+    ~ArrangeGuard() { g_inArrangeOverride = prev; }
+};
+
+// ---------------------------------------------------------------------------
+// Safety helpers
+// ---------------------------------------------------------------------------
+
+// Returns true if [p, p + size) is committed, readable memory.
+// Not race-free (memory can change after the check), but it avoids the most
+// common crash: dereferencing a stale or wrong pointer.
+bool IsReadable(const void* p, size_t size) {
+    if (!p || size == 0)
+        return false;
+
+    const BYTE* cur = static_cast<const BYTE*>(p);
+    const BYTE* end = cur + size;
+    if (end < cur)
+        return false;  // overflow
+
+    while (cur < end) {
+        MEMORY_BASIC_INFORMATION mbi;
+        if (!VirtualQuery(cur, &mbi, sizeof(mbi)))
+            return false;
+        if (mbi.State != MEM_COMMIT)
+            return false;
+        if (mbi.Protect == 0 || (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)))
+            return false;
+        const BYTE* regionEnd =
+            static_cast<const BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+        if (regionEnd <= cur)
+            return false;
+        cur = regionEnd;
+    }
+    return true;
+}
+
+// Windows build number (e.g. 26200), or 0 if it could not be read.
+DWORD GetWindowsBuildNumber() {
+    using RtlGetVersion_t = LONG(WINAPI*)(PRTL_OSVERSIONINFOW);
+    HMODULE ntdll = GetModuleHandle(L"ntdll.dll");
+    if (!ntdll)
+        return 0;
+    auto rtlGetVersion = reinterpret_cast<RtlGetVersion_t>(
+        reinterpret_cast<void*>(GetProcAddress(ntdll, "RtlGetVersion")));
+    if (!rtlGetVersion)
+        return 0;
+    RTL_OSVERSIONINFOW vi{};
+    vi.dwOSVersionInfoSize = sizeof(vi);
+    if (rtlGetVersion(&vi) != 0)
+        return 0;
+    return vi.dwBuildNumber;
+}
+
+bool IsTestedBuild(DWORD build) {
+    if (build == 0)
+        return false;
+    for (DWORD tested : kTestedBuilds) {
+        if (tested == build)
+            return true;
+    }
+    return false;
+}
+
+// Resolves the module that contains |addr|. Fills the module base name and
+// the RVA of |addr| inside it.
+bool GetModuleInfoFromAddress(const void* addr,
+                              WCHAR* outName,
+                              size_t outNameCount,
+                              size_t* outRva) {
+    HMODULE mod = nullptr;
+    if (!GetModuleHandleEx(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                               GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           reinterpret_cast<LPCWSTR>(addr), &mod) ||
+        !mod) {
+        return false;
+    }
+
+    WCHAR path[MAX_PATH];
+    DWORD len = GetModuleFileName(mod, path, ARRAYSIZE(path));
+    if (len == 0 || len >= ARRAYSIZE(path))
+        return false;
+
+    const WCHAR* base = wcsrchr(path, L'\\');
+    base = base ? base + 1 : path;
+    lstrcpynW(outName, base, static_cast<int>(outNameCount));
+
+    if (outRva) {
+        *outRva = static_cast<size_t>(static_cast<const BYTE*>(addr) -
+                                      reinterpret_cast<const BYTE*>(mod));
+    }
+    return true;
+}
+
+bool NameContainsXaml(const WCHAR* name) {
+    WCHAR lower[MAX_PATH];
+    lstrcpynW(lower, name, ARRAYSIZE(lower));
+    CharLowerBuffW(lower, lstrlenW(lower));
+    return wcsstr(lower, L"xaml") != nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// XAML tree helpers
+// ---------------------------------------------------------------------------
 
 template <typename F>
 FrameworkElement EnumChildElements(FrameworkElement element, F callback) {
     int count = Media::VisualTreeHelper::GetChildrenCount(element);
+
     for (int i = 0; i < count; i++) {
         auto child = Media::VisualTreeHelper::GetChild(element, i)
                          .try_as<FrameworkElement>();
         if (child && callback(child))
             return child;
     }
+
     return nullptr;
 }
 
@@ -82,19 +244,15 @@ FrameworkElement FindChildByName(FrameworkElement element, PCWSTR name) {
 }
 
 bool ApplyStyle(XamlRoot xamlRoot) {
-    // HARDENING: nunca chamar metodos num objeto nulo e nunca deixar
-    // excecao C++/WinRT escapar para dentro do Explorer.
     if (!xamlRoot)
         return false;
 
     try {
-        FrameworkElement child =
-            xamlRoot.Content().try_as<FrameworkElement>();
-
+        FrameworkElement child = xamlRoot.Content().try_as<FrameworkElement>();
         if (!child ||
             !(child = EnumChildElements(child, [](FrameworkElement c) {
-                return winrt::get_class_name(c) == L"Taskbar.TaskbarFrame";
-            })) ||
+                  return winrt::get_class_name(c) == L"Taskbar.TaskbarFrame";
+              })) ||
             !(child = FindChildByName(child, L"RootGrid")) ||
             !(child = FindChildByName(child, L"TaskbarFrameRepeater")))
             return false;
@@ -110,8 +268,7 @@ bool ApplyStyle(XamlRoot xamlRoot) {
             const Visibility wanted =
                 g_unloading ? Visibility::Visible : Visibility::Collapsed;
 
-            // HARDENING: so escreve se for diferente, evita invalidar
-            // o layout sem necessidade.
+            // Only write when different, to avoid useless layout invalidation.
             if (startButton.Visibility() != wanted)
                 startButton.Visibility(wanted);
         }
@@ -122,6 +279,10 @@ bool ApplyStyle(XamlRoot xamlRoot) {
         return false;
     }
 }
+
+// ---------------------------------------------------------------------------
+// Internal taskbar.dll pointers
+// ---------------------------------------------------------------------------
 
 void* CTaskBand_ITaskListWndSite_vftable;
 void* CSecondaryTaskBand_ITaskListWndSite_vftable;
@@ -144,24 +305,46 @@ XamlRoot XamlRootFromTaskbarHostSharedPtr(void* taskbarHostSharedPtr[2]) {
 
     XamlRoot result = nullptr;
 
-    // HARDENING: o original desreferenciava [0] mesmo quando so [1]
-    // estava preenchido. Agora [0] e conferido antes de qualquer leitura.
     if (taskbarHostSharedPtr[0] && TaskbarHost_FrameHeight_Original) {
         try {
-            size_t offset = 0x48;
-            const BYTE* b = (const BYTE*)TaskbarHost_FrameHeight_Original;
-            if (b[0] == 0x48 && b[1] == 0x83 && b[2] == 0xEC && b[4] == 0x48 &&
-                b[5] == 0x83 && b[6] == 0xC1 && b[7] <= 0x7F)
-                offset = b[7];
+            size_t offset = 0x48;  // fallback
+            bool fromPattern = false;
 
-            auto* unk =
-                *(IUnknown**)((BYTE*)taskbarHostSharedPtr[0] + offset);
-            if (unk) {
-                FrameworkElement fe = nullptr;
-                unk->QueryInterface(winrt::guid_of<FrameworkElement>(),
-                                    winrt::put_abi(fe));
-                if (fe)
-                    result = fe.XamlRoot();
+            const BYTE* b = (const BYTE*)TaskbarHost_FrameHeight_Original;
+            if (IsReadable(b, 8) && b[0] == 0x48 && b[1] == 0x83 &&
+                b[2] == 0xEC && b[4] == 0x48 && b[5] == 0x83 && b[6] == 0xC1 &&
+                b[7] <= 0x7F) {
+                offset = b[7];
+                fromPattern = true;
+            }
+
+            // Log once which source was used, so a silent fallback on a new
+            // build is visible in the Log tab.
+            if (!g_offsetSourceLogged.exchange(true)) {
+                Wh_Log(L"TaskbarHost offset 0x%X (source: %s)",
+                       (unsigned)offset,
+                       fromPattern ? L"byte pattern" : L"FALLBACK default");
+            }
+
+            BYTE* host = (BYTE*)taskbarHostSharedPtr[0];
+            IUnknown** slot = (IUnknown**)(host + offset);
+
+            if (!IsReadable(slot, sizeof(void*))) {
+                Wh_Log(L"TaskbarHost slot is not readable, skipping");
+            } else {
+                IUnknown* unk = *slot;
+                // The object must be readable and have a readable vtable
+                // before QueryInterface is called on it.
+                if (unk && IsReadable(unk, sizeof(void*)) &&
+                    IsReadable(*(void**)unk, sizeof(void*))) {
+                    FrameworkElement fe = nullptr;
+                    unk->QueryInterface(winrt::guid_of<FrameworkElement>(),
+                                        winrt::put_abi(fe));
+                    if (fe)
+                        result = fe.XamlRoot();
+                } else if (unk) {
+                    Wh_Log(L"TaskbarHost object/vtable not readable, skipping");
+                }
             }
         } catch (...) {
             Wh_Log(L"XamlRootFromTaskbarHostSharedPtr failed");
@@ -169,7 +352,7 @@ XamlRoot XamlRootFromTaskbarHostSharedPtr(void* taskbarHostSharedPtr[2]) {
         }
     }
 
-    // A referencia sempre e liberada, mesmo se algo acima falhou.
+    // The reference is always released, even if something above failed.
     if (taskbarHostSharedPtr[1] && std__Ref_count_base__Decref_Original)
         std__Ref_count_base__Decref_Original(taskbarHostSharedPtr[1]);
 
@@ -177,9 +360,9 @@ XamlRoot XamlRootFromTaskbarHostSharedPtr(void* taskbarHostSharedPtr[2]) {
 }
 
 XamlRoot GetTaskbarXamlRoot(HWND hWnd, bool isSecondary) {
-    HWND hTaskSwWnd = isSecondary
-        ? (HWND)FindWindowEx(hWnd, nullptr, L"WorkerW", nullptr)
-        : (HWND)GetProp(hWnd, L"TaskbandHWND");
+    HWND hTaskSwWnd =
+        isSecondary ? (HWND)FindWindowEx(hWnd, nullptr, L"WorkerW", nullptr)
+                    : (HWND)GetProp(hWnd, L"TaskbandHWND");
     if (!hTaskSwWnd)
         return nullptr;
 
@@ -189,12 +372,13 @@ XamlRoot GetTaskbarXamlRoot(HWND hWnd, bool isSecondary) {
         return nullptr;
 
     void* p = (void*)GetWindowLongPtr(hTaskSwWnd, 0);
-    if (!p)  // HARDENING: o original lia *(void**)p sem checar nulo
+    if (!p)
         return nullptr;
 
     for (int i = 0; *(void**)p != vftable; i++) {
         if (i == 20)
             return nullptr;
+
         p = (void**)p + 1;
     }
 
@@ -208,6 +392,7 @@ XamlRoot GetTaskbarXamlRoot(HWND hWnd, bool isSecondary) {
             return nullptr;
         CTaskBand_GetTaskbarHost_Original(p, sharedPtr);
     }
+
     return XamlRootFromTaskbarHostSharedPtr(sharedPtr);
 }
 
@@ -219,6 +404,7 @@ HWND FindCurrentProcessTaskbarWnd() {
         if (pid == GetCurrentProcessId())
             return hWnd;
     }
+
     return nullptr;
 }
 
@@ -263,28 +449,38 @@ void ApplySettings(HWND hTaskbarWnd) {
     HHOOK hook = SetWindowsHookEx(
         WH_CALLWNDPROC,
         [](int nCode, WPARAM wParam, LPARAM lParam) -> LRESULT {
-            if (nCode == HC_ACTION &&
-                ((const CWPSTRUCT*)lParam)->message == msg)
-                ApplySettingsFromTaskbarThread();
+            try {
+                if (nCode == HC_ACTION &&
+                    ((const CWPSTRUCT*)lParam)->message == msg)
+                    ApplySettingsFromTaskbarThread();
+            } catch (...) {
+                Wh_Log(L"Window hook callback failed");
+            }
             return CallNextHookEx(nullptr, nCode, wParam, lParam);
         },
         nullptr, threadId);
-    if (!hook)
+    if (!hook) {
+        Wh_Log(L"SetWindowsHookEx failed");
         return;
+    }
 
-    // HARDENING: SendMessage puro pode travar para sempre se a thread da
-    // barra estiver ocupada. Com timeout o Explorer nunca fica bloqueado.
     DWORD_PTR ignored = 0;
     if (!SendMessageTimeout(hTaskbarWnd, msg, 0, 0,
                             SMTO_ABORTIFHUNG | SMTO_NORMAL, 2000, &ignored)) {
         Wh_Log(L"SendMessageTimeout to the taskbar window failed or timed out");
     }
+
     UnhookWindowsHookEx(hook);
 }
+
+// ---------------------------------------------------------------------------
+// IUIElement::Arrange hook (closes the gap left by the hidden button)
+// ---------------------------------------------------------------------------
 
 using IUIElement_Arrange_t =
     HRESULT(WINAPI*)(void* pThis, winrt::Windows::Foundation::Rect rect);
 IUIElement_Arrange_t IUIElement_Arrange_Original;
+
 HRESULT WINAPI IUIElement_Arrange_Hook(void* pThis,
                                        winrt::Windows::Foundation::Rect rect) {
     auto original = [=] { return IUIElement_Arrange_Original(pThis, rect); };
@@ -306,15 +502,75 @@ HRESULT WINAPI IUIElement_Arrange_Hook(void* pThis,
                 L"StartButton")
             return original();
 
-        // HARDENING: so escreve a propriedade quando ela mudou.
         if (element.Visibility() != Visibility::Collapsed)
             element.Visibility(Visibility::Collapsed);
     } catch (...) {
-        // Se algo falhar, o layout segue como se o mod nao existisse.
+        // If anything fails, layout proceeds as if the mod did not exist.
         return original();
     }
 
     return IUIElement_Arrange_Original(pThis, {0, 0, 0, rect.Height});
+}
+
+// Validates and installs the Arrange hook. On any doubt it does NOT hook and
+// the mod stays in degraded mode (button collapsed, gap not closed).
+bool SetupArrangeHook() {
+    Shapes::Rectangle rectangle;
+    IUIElement element = rectangle;
+    void** vtable = *(void***)winrt::get_abi(element);
+
+    if (!IsReadable(vtable, (kArrangeVtableIndex + 2) * sizeof(void*))) {
+        Wh_Log(L"vtable is not readable up to index %d, degraded mode",
+               kArrangeVtableIndex);
+        return false;
+    }
+
+    void* target = vtable[kArrangeVtableIndex];
+    if (!target) {
+        Wh_Log(L"vtable[%d] is null, degraded mode", kArrangeVtableIndex);
+        return false;
+    }
+
+    WCHAR moduleName[MAX_PATH] = L"?";
+    size_t rva = 0;
+    if (!GetModuleInfoFromAddress(target, moduleName, ARRAYSIZE(moduleName),
+                                  &rva)) {
+        Wh_Log(L"vtable[%d] does not belong to a known module, degraded mode",
+               kArrangeVtableIndex);
+        return false;
+    }
+
+    // Always log this: it is the data needed to support new Windows builds.
+    Wh_Log(L"Arrange candidate vtable[%d] = %s+0x%X", kArrangeVtableIndex,
+           moduleName, (unsigned)rva);
+
+    if (!NameContainsXaml(moduleName)) {
+        Wh_Log(L"vtable[%d] is not in a XAML module, degraded mode",
+               kArrangeVtableIndex);
+        return false;
+    }
+
+    // Informational only: neighbors in the vtable, to help future diagnosis.
+    for (int idx : {kArrangeVtableIndex - 1, kArrangeVtableIndex + 1}) {
+        WCHAR n[MAX_PATH] = L"?";
+        size_t r = 0;
+        if (vtable[idx] &&
+            GetModuleInfoFromAddress(vtable[idx], n, ARRAYSIZE(n), &r)) {
+            Wh_Log(L"  vtable[%d] = %s+0x%X", idx, n, (unsigned)r);
+        }
+    }
+
+    if (!WindhawkUtils::SetFunctionHook((IUIElement_Arrange_t)target,
+                                        IUIElement_Arrange_Hook,
+                                        &IUIElement_Arrange_Original)) {
+        Wh_Log(L"Failed to hook IUIElement::Arrange, degraded mode");
+        return false;
+    }
+
+    Wh_ApplyHookOperations();
+    g_arrangeHookActive = true;
+    Wh_Log(L"Arrange hook installed");
+    return true;
 }
 
 using TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_t =
@@ -324,6 +580,7 @@ using TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_t =
                      winrt::Windows::Foundation::Size* resultSize);
 TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_t
     TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Original;
+
 HRESULT WINAPI TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Hook(
     void* pThis,
     void* context,
@@ -331,33 +588,22 @@ HRESULT WINAPI TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Hook(
     winrt::Windows::Foundation::Size* resultSize) {
     [[maybe_unused]] static bool hooked = [] {
         try {
-            Shapes::Rectangle rectangle;
-            IUIElement element = rectangle;
-            void** vtable = *(void***)winrt::get_abi(element);
-            if (vtable) {
-                // ATENCAO: o indice 92 e um detalhe interno do Windows.
-                // Ele nao pode ser validado aqui; se uma atualizacao do
-                // Windows mudar esse indice, desative o mod.
-                if (!WindhawkUtils::SetFunctionHook(
-                        (IUIElement_Arrange_t)vtable[92],
-                        IUIElement_Arrange_Hook,
-                        &IUIElement_Arrange_Original)) {
-                    Wh_Log(L"Failed to hook IUIElement::Arrange");
-                }
-                Wh_ApplyHookOperations();
-            }
+            if (!SetupArrangeHook())
+                Wh_Log(L"Running in degraded mode (gap may remain)");
         } catch (...) {
             Wh_Log(L"Failed to set up the Arrange hook");
         }
         return true;
     }();
 
-    g_inArrangeOverride = true;
-    HRESULT ret = TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Original(
+    ArrangeGuard guard;
+    return TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Original(
         pThis, context, size, resultSize);
-    g_inArrangeOverride = false;
-    return ret;
 }
+
+// ---------------------------------------------------------------------------
+// Symbol hooking
+// ---------------------------------------------------------------------------
 
 bool HookTaskbarDllSymbols() {
     HMODULE module =
@@ -379,6 +625,7 @@ bool HookTaskbarDllSymbols() {
         {{LR"(public: void __cdecl std::_Ref_count_base::_Decref(void))"},
          &std__Ref_count_base__Decref_Original},
     };
+
     return HookSymbols(module, taskbarDllHooks, ARRAYSIZE(taskbarDllHooks));
 }
 
@@ -389,6 +636,7 @@ bool HookTaskbarViewDllSymbols(HMODULE module) {
          &TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Original,
          TaskbarCollapsibleLayoutXamlTraits_ArrangeOverride_Hook},
     };
+
     return HookSymbols(module, hooks, ARRAYSIZE(hooks));
 }
 
@@ -406,16 +654,41 @@ HMODULE WINAPI LoadLibraryExW_Hook(LPCWSTR lpLibFileName,
     if (module && !g_taskbarViewDllLoaded &&
         GetTaskbarViewModuleHandle() == module &&
         !g_taskbarViewDllLoaded.exchange(true)) {
-        if (HookTaskbarViewDllSymbols(module))
-            Wh_ApplyHookOperations();
+        try {
+            if (HookTaskbarViewDllSymbols(module))
+                Wh_ApplyHookOperations();
+        } catch (...) {
+            Wh_Log(L"Hooking Taskbar.View.dll symbols failed");
+        }
     }
+
     return module;
 }
 
+// ---------------------------------------------------------------------------
+// Windhawk entry points
+// ---------------------------------------------------------------------------
+
 BOOL Wh_ModInit() {
-    // Falha segura: se os simbolos internos nao forem encontrados (por
-    // exemplo apos uma atualizacao do Windows), o mod simplesmente nao
-    // carrega e o Explorer segue normal.
+    // Fail closed: untested Windows builds are refused unless the user opts in.
+    const DWORD build = GetWindowsBuildNumber();
+    const bool allowUntested = Wh_GetIntSetting(L"allowUntestedBuilds") != 0;
+
+    Wh_Log(L"Windows build: %d", (int)build);
+
+    if (!IsTestedBuild(build)) {
+        if (!allowUntested) {
+            Wh_Log(L"Build %d was not tested with this mod. Not loading. "
+                   L"Enable 'Allow untested Windows builds' to try it.",
+                   (int)build);
+            return FALSE;
+        }
+        Wh_Log(L"WARNING: running on an untested build (%d) by user choice",
+               (int)build);
+    }
+
+    // If internal symbols are not found (e.g. after a Windows update), the mod
+    // simply does not load and Explorer runs normally.
     if (!HookTaskbarDllSymbols()) {
         Wh_Log(L"taskbar.dll symbols not found, mod not loaded");
         return FALSE;
@@ -436,32 +709,46 @@ BOOL Wh_ModInit() {
             Wh_Log(L"LoadLibraryExW not found in kernelbase.dll");
             return FALSE;
         }
-        WindhawkUtils::SetFunctionHook(pLoadLib, LoadLibraryExW_Hook,
-                                       &LoadLibraryExW_Original);
+
+        if (!WindhawkUtils::SetFunctionHook(pLoadLib, LoadLibraryExW_Hook,
+                                            &LoadLibraryExW_Original)) {
+            Wh_Log(L"Failed to hook LoadLibraryExW");
+            return FALSE;
+        }
     }
+
     return TRUE;
 }
 
 void Wh_ModAfterInit() {
-    if (!g_taskbarViewDllLoaded) {
-        if (HMODULE m = GetTaskbarViewModuleHandle()) {
-            if (!g_taskbarViewDllLoaded.exchange(true)) {
-                if (HookTaskbarViewDllSymbols(m))
-                    Wh_ApplyHookOperations();
+    try {
+        if (!g_taskbarViewDllLoaded) {
+            if (HMODULE m = GetTaskbarViewModuleHandle()) {
+                if (!g_taskbarViewDllLoaded.exchange(true)) {
+                    if (HookTaskbarViewDllSymbols(m))
+                        Wh_ApplyHookOperations();
+                }
             }
         }
-    }
 
-    HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
-    if (hTaskbarWnd)
-        ApplySettings(hTaskbarWnd);
+        HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
+        if (hTaskbarWnd)
+            ApplySettings(hTaskbarWnd);
+    } catch (...) {
+        Wh_Log(L"Wh_ModAfterInit failed");
+    }
 }
 
 void Wh_ModBeforeUninit() {
     g_unloading = true;
-    HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
-    if (hTaskbarWnd)
-        ApplySettings(hTaskbarWnd);
+
+    try {
+        HWND hTaskbarWnd = FindCurrentProcessTaskbarWnd();
+        if (hTaskbarWnd)
+            ApplySettings(hTaskbarWnd);
+    } catch (...) {
+        Wh_Log(L"Wh_ModBeforeUninit failed");
+    }
 }
 
 void Wh_ModUninit() {}
